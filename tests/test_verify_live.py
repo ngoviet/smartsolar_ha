@@ -244,6 +244,36 @@ class TestSettlingStateMachine:
         assert len(seen) == 2
 
 
+class TestPv1OrderingCheck:
+    """pv1_total_energy is a lifetime counter: it grows, it must not go stale.
+
+    The check used to be "within 20 kWh of 388.019", which failed on
+    2026-10-12 at 408.8 — a correct, ever-growing counter. What it guards is
+    the PV1/PV2 ordering, and the other device is already above 1000 kWh.
+    """
+
+    @staticmethod
+    def _with_pv1(monkeypatch, value: str):
+        machine = [
+            dict(entry, state=value) if entry["entity_id"] == f"{verify_live.PREFIX}pv1_total_energy" else entry
+            for entry in _complete_state_machine()
+        ]
+        TestSettlingStateMachine._run(monkeypatch, [machine])
+
+    @pytest.mark.parametrize("value", ["388.019", "408.757", "650.0"])
+    def test_a_grown_counter_still_passes(self, monkeypatch, capsys, value):
+        self._with_pv1(monkeypatch, value)
+
+        assert verify_live.main() == 0
+
+    @pytest.mark.parametrize("value", ["1013.4", "120.0"])
+    def test_a_swapped_or_wrong_device_fails(self, monkeypatch, capsys, value):
+        self._with_pv1(monkeypatch, value)
+
+        assert verify_live.main() == 1
+        assert f"FAIL pv1_total_energy = {value}" in capsys.readouterr().out
+
+
 class TestExpectedEntities:
     """The wait list must cover every entity the checks read, or it proves nothing."""
 

@@ -234,16 +234,24 @@ def main() -> int:
         check(state is not None, f"{entity} present = {state['state'] if state else 'MISSING'}")
 
     # 5. PV1 must be the lowest GUID (547611) — the stable ordering contract.
+    # total_energy is a lifetime counter (~1.5 kWh/day), so a fixed "near X"
+    # target goes stale on its own: 388.019 +/- 20 started failing on
+    # 2026-10-12 at 408.8 with nothing wrong. Check what the step is for: the
+    # value never drops below the 547611 baseline and stays far below the
+    # other device (GUID 14756976, already > 1000 kWh), so a PV1/PV2 swap fails.
     pv1 = states.get(f"{PREFIX}pv1_total_energy")
-    pv1_expected = 388.019
+    pv1_baseline = 388.019
+    pv1_ceiling = 900.0
     pv1_value = as_float(pv1["state"]) if pv1 else None
     if pv1 is None:
         check(False, "pv1_total_energy missing")
     elif pv1_value is None:
-        check(False, f"pv1_total_energy = {pv1['state']!r} (expected a number near {pv1_expected})")
+        check(False, f"pv1_total_energy = {pv1['state']!r} (expected a number >= {pv1_baseline})")
     else:
-        delta = abs(pv1_value - pv1_expected)
-        check(delta < 20, f"pv1_total_energy = {pv1['state']} (expected ~{pv1_expected} for GUID 547611)")
+        check(
+            pv1_baseline <= pv1_value < pv1_ceiling,
+            f"pv1_total_energy = {pv1['state']} (GUID 547611: expected {pv1_baseline} <= x < {pv1_ceiling})",
+        )
 
     # 6. The number entity must be present.
     number = states.get(NUMBER_ENTITY)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
@@ -67,6 +68,7 @@ class SmartSolarDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         "_daily_stats",
         "_daily_tracker_unsub",
         "_mqtt_notify_unsub",
+        "_last_listener_update",
         "_consecutive_api_failures",
         "_outage_started",
     )
@@ -101,10 +103,13 @@ class SmartSolarDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._daily_stats: dict[str, dict[str, Any]] = {}
         self._daily_tracker_unsub: Callable[[], None] | None = None
 
-        # MQTT-driven listener refresh, throttled to at most one per second.
-        # See async_process_mqtt_data() for why this must NOT be
-        # async_set_updated_data().
+        # MQTT-driven listener refresh, coalesced to at most one per update
+        # interval (see _schedule_mqtt_notify). See async_process_mqtt_data()
+        # for why this must NOT be async_set_updated_data().
         self._mqtt_notify_unsub: Callable[[], None] | None = None
+        # time.monotonic() of the last entity refresh from ANY source (HTTP poll
+        # or MQTT), so MQTT can coalesce against a poll that just published.
+        self._last_listener_update = float("-inf")
 
         # Cloud-outage bookkeeping. A failing poll reports itself through
         # UpdateFailed, which Home Assistant already logs once per transition,
@@ -262,8 +267,8 @@ class SmartSolarDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.data is None:
             return
 
-        # Patch the payload in-place, then notify at most once per second so a
-        # burst of messages coalesces into a single round of entity updates.
+        # Patch the payload in-place, then notify at most once per update interval
+        # so the stream of messages coalesces into one round of entity updates.
         self._merge_mqtt_into_data(self.data, device_guid, data)
         self._schedule_mqtt_notify()
 
@@ -295,22 +300,47 @@ class SmartSolarDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return sorted(guids, key=guid_sort_key)
 
     @callback
+    def async_update_listeners(self) -> None:
+        """Refresh entities, remembering when so MQTT can coalesce against it."""
+        self._last_listener_update = time.monotonic()
+        super().async_update_listeners()
+
+    def _notify_period(self) -> float:
+        """Seconds between entity refreshes: the Update Frequency setting.
+
+        The device publishes ~2 messages per second. Refreshing entities on
+        every one of them (the old fixed 1 s cap) ignored the user's Update
+        Frequency and made the recorder store ~1 row per second per sensor
+        (measured 2026-10-12: 60-75k rows/day per sensor, a 4-5 MB payload for
+        one 24 h history graph). MQTT_NOTIFY_THROTTLE remains the floor.
+        """
+        if self.update_interval is None:
+            return MQTT_NOTIFY_THROTTLE
+        return max(MQTT_NOTIFY_THROTTLE, self.update_interval.total_seconds())
+
+    @callback
     def _schedule_mqtt_notify(self) -> None:
-        """Notify entities of MQTT data, rate-limited to 1Hz.
+        """Notify entities of MQTT data at most once per update interval.
 
         Values are merged into ``self.data`` on every message; only the
-        listener refresh is throttled, so nothing is lost — the next allowed
-        refresh publishes the newest merged values.
+        listener refresh is coalesced, so nothing is lost — the trailing
+        refresh publishes the newest merged values. The window is measured from
+        the last refresh of any kind, so an HTTP poll that just published
+        pushes the MQTT refresh back instead of doubling it.
         """
         if self._mqtt_notify_unsub is not None:
             return
-        self.async_update_listeners()
-        self._mqtt_notify_unsub = async_call_later(self.hass, MQTT_NOTIFY_THROTTLE, self._async_mqtt_notify_done)
+        wait = self._last_listener_update + self._notify_period() - time.monotonic()
+        if wait <= 0:
+            self.async_update_listeners()
+            return
+        self._mqtt_notify_unsub = async_call_later(self.hass, wait, self._async_mqtt_notify_done)
 
     @callback
     def _async_mqtt_notify_done(self, _now: datetime) -> None:
-        """Release the 1Hz gate so the next MQTT message can notify."""
+        """Publish the coalesced MQTT values (or wait again after a fresh poll)."""
         self._mqtt_notify_unsub = None
+        self._schedule_mqtt_notify()
 
     def _mqtt_to_data_stream(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         """Convert flat MQTT data dict to dataStreams list format.

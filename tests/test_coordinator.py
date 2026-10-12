@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from copy import deepcopy
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -774,3 +774,92 @@ class TestFixtureIsolation:
         sample_project_response["deviceLogs"][0]["deviceGuid"] = "mutated"
 
         assert SAMPLE_PROJECT_RESPONSE["deviceLogs"][0]["deviceGuid"] == "547611"
+
+
+class TestMqttNotifyCoalescing:
+    """MQTT refreshes entities at most once per update interval, not per message."""
+
+    MODULE = "custom_components.smartsolar_ha.coordinator"
+
+    def _coordinator(self, mock_hass, mock_api, mock_config_entry, seconds: int = 10):
+        coordinator = SmartSolarDataUpdateCoordinator(
+            hass=mock_hass,
+            api=mock_api,
+            entry=mock_config_entry,
+            update_interval=timedelta(seconds=seconds),
+        )
+        coordinator.data = {
+            "_mode": "project",
+            "deviceLogs": [{"deviceGuid": "547611", "dataStreams": [{"name": "pv_voltage", "value": "5.0"}]}],
+        }
+        coordinator.discovered_devices = {"547611"}
+        return coordinator
+
+    @pytest.mark.asyncio
+    async def test_burst_within_interval_coalesces_into_one_trailing_refresh(
+        self, mock_hass, mock_api, mock_config_entry
+    ):
+        coordinator = self._coordinator(mock_hass, mock_api, mock_config_entry)
+        listener = MagicMock()
+        coordinator.async_add_listener(listener)
+        clock = [1000.0]
+        call_later = MagicMock(return_value=MagicMock())
+
+        with (
+            patch(f"{self.MODULE}.time.monotonic", side_effect=lambda: clock[0]),
+            patch(f"{self.MODULE}.async_call_later", call_later),
+        ):
+            await coordinator.async_process_mqtt_data("547611", {"pv_voltage": 12.0})
+            assert listener.call_count == 1  # first message publishes at once
+
+            for i in range(19):  # ~2 msg/s for the next 9.5 s
+                clock[0] += 0.5
+                await coordinator.async_process_mqtt_data("547611", {"pv_voltage": 12.0 + i})
+
+            assert listener.call_count == 1
+            assert call_later.call_count == 1  # one trailing refresh, not one per message
+            assert call_later.call_args.args[1] == pytest.approx(9.5)
+
+            clock[0] = 1010.0
+            coordinator._async_mqtt_notify_done(datetime.now())
+
+        assert listener.call_count == 2
+        streams = {s["name"]: s["value"] for s in coordinator.data["deviceLogs"][0]["dataStreams"]}
+        assert streams["pv_voltage"] == "30.0"  # newest merged value, nothing lost
+
+    @pytest.mark.asyncio
+    async def test_poll_refresh_pushes_the_mqtt_refresh_back(self, mock_hass, mock_api, mock_config_entry):
+        coordinator = self._coordinator(mock_hass, mock_api, mock_config_entry)
+        listener = MagicMock()
+        coordinator.async_add_listener(listener)
+        clock = [1000.0]
+        call_later = MagicMock(return_value=MagicMock())
+
+        with (
+            patch(f"{self.MODULE}.time.monotonic", side_effect=lambda: clock[0]),
+            patch(f"{self.MODULE}.async_call_later", call_later),
+        ):
+            coordinator.async_update_listeners()  # what an HTTP poll does
+            clock[0] += 3
+            await coordinator.async_process_mqtt_data("547611", {"pv_voltage": 12.0})
+            assert call_later.call_args.args[1] == pytest.approx(7.0)
+
+            clock[0] += 5  # a second poll lands before the trailing refresh fires
+            coordinator.async_update_listeners()
+            clock[0] += 2
+            coordinator._async_mqtt_notify_done(datetime.now())
+
+        assert listener.call_count == 2  # the two polls only; MQTT waits again
+        assert call_later.call_count == 2
+        assert call_later.call_args.args[1] == pytest.approx(8.0)
+
+    @pytest.mark.asyncio
+    async def test_window_follows_the_update_frequency_setting(self, mock_hass, mock_api, mock_config_entry):
+        coordinator = self._coordinator(mock_hass, mock_api, mock_config_entry, seconds=5)
+        assert coordinator._notify_period() == 5.0
+
+        coordinator.update_interval = timedelta(seconds=20)  # number entity change
+        assert coordinator._notify_period() == 20.0
+
+        coordinator.update_interval = None
+        assert coordinator._notify_period() == 1.0  # MQTT_NOTIFY_THROTTLE floor

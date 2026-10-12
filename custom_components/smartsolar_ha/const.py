@@ -13,7 +13,7 @@ DOMAIN = "smartsolar_ha"
 _LOGGER = logging.getLogger(__name__)
 
 # Integration release version — keep in sync with manifest.json / pyproject.toml
-VERSION = "2.0.6"
+VERSION = "2.0.7"
 
 # Child loggers so users can silence just the noisy parts:
 #   logger:
@@ -53,14 +53,13 @@ MQTT_FIELD_MAPPING: dict[str, str] = {
 DEFAULT_UPDATE_INTERVAL = timedelta(seconds=5)  # 5 seconds
 MIN_UPDATE_INTERVAL = 1  # 1 second
 MAX_UPDATE_INTERVAL = 30  # 30 seconds
-# MQTT messages arrive ~2/s per device. Without a cap every message triggers a
-# full round of entity updates, which is wasted work when the poll interval is
-# 5s. Values still merge into coordinator.data on every message; only the
-# listener refresh is capped.
-#
-# NOTE: this does NOT reduce recorder volume. The sensors genuinely fluctuate
-# ~1x/second (measured: 10 distinct values in 15 min; rounding to 2dp recovers
-# only 15%), so the recorder writes on real change regardless of this cap.
+# MQTT messages arrive ~2/s per device. Values merge into coordinator.data on
+# every message, but entities are refreshed at most once per update interval
+# (the Update Frequency number entity), measured from the last refresh by
+# either MQTT or the HTTP poll. This cap is what bounds recorder volume: the
+# sensors genuinely fluctuate ~1x/second, so with a 1 s cap the recorder wrote
+# ~1 row per second per sensor. MQTT_NOTIFY_THROTTLE is the floor of that
+# window (= MIN_UPDATE_INTERVAL).
 MQTT_NOTIFY_THROTTLE = 1.0  # seconds
 TOKEN_REFRESH_DAYS_BEFORE_EXPIRY = 7  # days
 RETRY_MAX_ATTEMPTS = 3

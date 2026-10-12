@@ -1,6 +1,6 @@
 # SmartSolar MPPT MQ — Toàn Bộ Kiến Thức API & Tích Hợp
 
-> **Trạng thái**: ✅ LIVE · **Phiên bản**: **v2.0.6** (2026-09-30) · **Nguồn sự thật**: [../STATUS.md](../STATUS.md) · **Cập nhật**: 2026-09-30
+> **Trạng thái**: ✅ LIVE · **Phiên bản**: **v2.0.7** (2026-10-12) · **Nguồn sự thật**: [../STATUS.md](../STATUS.md) · **Cập nhật**: 2026-09-30
 >
 > ⚠️ **v2.0.0 đổi domain `smartsolar_mppt` → `smartsolar_ha`** (thư mục, `manifest.domain`,
 > import, tên service, đường dẫn deploy). HA xác định integration theo **tên thư mục** phải
@@ -18,6 +18,13 @@
 >
 > ⚠️ Nội dung tổng hợp **2026-06-22**, đã bổ sung mục [7.4 — audit v1.5.1](#74-đã-fix-trong-v151-2026-09-27--audit-toàn-diện).
 > Đối chiếu lại entity thực tế nếu có sai lệch.
+>
+> 📌 **v2.0.7 (2026-10-12)** — **MQTT tôn trọng "Update Frequency".** Thiết bị đẩy MQTT
+> ~2 tin/giây; trước đây entity cập nhật **mỗi 1 s** (gate cứng `MQTT_NOTIFY_THROTTLE`) bất kể
+> cài đặt 5 s ⇒ **60–75 nghìn dòng recorder/ngày/sensor**, 1 biểu đồ 24 h nặng **4–5 MB**. Nay
+> gom: tối đa **1 lần cập nhật mỗi chu kỳ**, tính chung cả poll HTTP lẫn MQTT (trailing
+> refresh luôn đẩy giá trị mới nhất, không mất dữ liệu). Live đặt **10 s** ⇒ **~9,2 nghìn
+> dòng/ngày/sensor (−88%)**. Đặt Update Frequency = 1 để có lại tốc độ cũ.
 >
 > 📌 **v2.0.6 (2026-09-30)** — **sai mật khẩu giờ do HA hỏi lại, không còn là "outage".**
 > `api.login()` tách riêng `SmartSolarInvalidCredentialsError` (401 lúc đăng nhập = mật khẩu

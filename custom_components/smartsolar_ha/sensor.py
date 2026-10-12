@@ -464,7 +464,7 @@ class SmartSolarProjectDeviceSensor(SmartSolarSensor):
         device_log_entries = device_logs(self.coordinator.data)
         if not device_log_entries:
             # Debug, not warning: this fires for every sensor of the entry on
-            # every poll (and once per second per MQTT message), which used to
+            # every poll (and every coalesced MQTT refresh), which used to
             # flood the log while the first refresh was still failing.
             _LOGGER.debug("No deviceLogs in coordinator data, keys: %s", list(self.coordinator.data.keys()))
             return None

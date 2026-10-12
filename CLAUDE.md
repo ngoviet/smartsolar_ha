@@ -3,7 +3,7 @@
 > **System info**: [../System_info/CLAUDE.md](../System_info/CLAUDE.md) — HA at 192.168.10.15, network, credentials
 > **Code search**: `semble search "query" .` — intent-based, ~98% fewer tokens than grep
 
-Home Assistant custom integration for SmartSolar MPPT solar charge controllers. Fetches real-time metrics via HTTP API from `api.smartsolar.io.vn` and MQTT WebSocket Secure from `mqttx.smartsolar.io.vn:8084`. **Current version: v2.0.6**, verified live against HA **2026.9.4** on 2026-09-30 (the test extra pins that same version); every release is deployed to the reference installation and checked with `verify_live.py` right after its tag.
+Home Assistant custom integration for SmartSolar MPPT solar charge controllers. Fetches real-time metrics via HTTP API from `api.smartsolar.io.vn` and MQTT WebSocket Secure from `mqttx.smartsolar.io.vn:8084`. **Current version: v2.0.7**, verified live against HA **2026.10.1** on 2026-10-12 (the test extra pins that same version); every release is deployed to the reference installation and checked with `verify_live.py` right after its tag.
 
 > ⚠️ **v2.0.0 renamed the domain from `smartsolar_mppt` to `smartsolar_ha`.**
 > Home Assistant identifies an integration by its folder name, which must equal
@@ -19,7 +19,7 @@ Home Assistant custom integration for SmartSolar MPPT solar charge controllers. 
 ```
 custom_components/smartsolar_ha/
 ├── __init__.py          # Integration entry point, setup/unload, service registration, async_migrate_entry
-├── manifest.json        # v2.0.6, domain=smartsolar_ha, config_flow=true
+├── manifest.json        # v2.0.7, domain=smartsolar_ha, config_flow=true
 ├── const.py             # Constants, SENSOR_TYPES, AGGREGATION, MQTT config, build_device_info helper
 ├── helpers.py           # Pure helpers: coerce_float, device_logs, as_list, stream_dict, guid_sort_key
 ├── config_flow.py       # Multi-step config flow: auth → mode → device/project, reauth, reconfigure
@@ -174,6 +174,37 @@ both chargers sit on the same 24 V bus, so summing reports ~53 V:
 Sensors in `const.UNRELIABLE_SYNTHESIS_SENSORS` (charge_power, currents,
 signal_quality) always aggregate locally because the server's
 `synthesisStreams` value is frequently stale or absent.
+
+## v2.0.7 — MQTT Honours the Update Frequency (2026-10-12)
+
+The devices publish ~2 MQTT messages per second and the coordinator refreshed
+every entity on each of them, capped only by a hard-coded 1 s gate
+(`MQTT_NOTIFY_THROTTLE`). The **Update Frequency** number entity (default 5 s)
+therefore only paced the HTTP poll: the entities still changed once per second.
+Measured on the reference installation: **60–75k recorder rows per day per
+sensor**, a 2.86 GB database with 7-day retention, a **4.4–5.3 MB** payload for
+one 24 h history graph, and 33 dashboard templates re-rendered every second.
+
+- **One refresh per update interval, from any source.** `async_update_listeners`
+  is overridden to stamp `time.monotonic()`; `_schedule_mqtt_notify` refreshes
+  at once only if a full interval has passed since the last refresh — poll *or*
+  MQTT — and otherwise arms a single trailing `async_call_later` for the
+  remainder. When that fires it re-checks, so a poll that published in the
+  meantime pushes the MQTT refresh back instead of doubling it.
+- **Nothing is lost.** Every message is still merged into `coordinator.data`;
+  the trailing refresh publishes the newest merged values. Daily stats still
+  update per message.
+- `MQTT_NOTIFY_THROTTLE` (1 s) is now the floor of the window, so Update
+  Frequency = 1 reproduces the old behaviour exactly.
+- **Live result** (Update Frequency set to 10 s): **~9.2k rows/day per sensor
+  (−88%)**; whole-instance recorder writes at noon 1,520 → 730 rows/min.
+- `verify_live.py`: the PV1 ordering check compared the lifetime
+  `pv1_total_energy` counter with a fixed `388.019 ± 20`, which went stale on
+  its own (408.8 on 2026-10-12, nothing wrong). It now checks
+  `388.019 <= x < 900` — the counter never drops, and a PV1/PV2 swap (the other
+  device is > 1000 kWh) still fails.
+- Tests: 3 coalescing tests (fail on v2.0.6, pass now) + 5 for the
+  verify_live check — 593 passed.
 
 ## v2.0.6 — A Wrong Password Asks the User (2026-09-30)
 
