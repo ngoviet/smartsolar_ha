@@ -58,7 +58,7 @@ pyproject.toml           # Python project config: ruff, mypy, pytest, [test] ext
 .pre-commit-config.yaml  # Pre-commit hooks: ruff, yaml/json checks
 LICENSE                  # MIT License
 upload_to_ha.py          # Minimal uploader: paramiko SSH + base64 + sudo tee
-deploy_to_ha.py          # Full deploy gate: lint+types+tests → backup → upload → restart → wait
+deploy_to_ha.py          # Full deploy gate: lint+types+tests → backup → upload (LF) → sha256 verify → clean restart → wait
 verify_live.py           # Asserts the deployed entities are correct on the live instance
 tests/
 ├── conftest.py           # Shared fixtures: mock HA, recorded API responses (deep-copied), coordinator
@@ -73,7 +73,7 @@ tests/
 ├── test_const.py         # Sensor metadata invariants
 ├── test_packaging.py     # manifest.json / hacs.json / brand-asset invariants
 ├── test_verify_live.py   # verify_live.py payload handling and exit codes
-├── test_deploy_script.py # deploy_to_ha.py prune/archive/wait + local-gate == CI
+├── test_deploy_script.py # deploy_to_ha.py prune/archive/wait/restart/sha256 + local-gate == CI
 └── test_e2e.py           # Real async_setup_entry/unload_entry against a real HA core
 .github/workflows/
 ├── ci.yml                # ruff check + format, mypy (hard gate), pytest with coverage
@@ -198,6 +198,17 @@ one 24 h history graph, and 33 dashboard templates re-rendered every second.
   Frequency = 1 reproduces the old behaviour exactly.
 - **Live result** (Update Frequency set to 10 s): **~9.2k rows/day per sensor
   (−88%)**; whole-instance recorder writes at noon 1,520 → 730 rows/min.
+- `deploy_to_ha.py` (tooling, after the tag): with `core.autocrlf=true` it
+  uploaded the CRLF working tree, so 13 of 18 files on the host differed from
+  the v2.0.7 tag by line endings alone. `deploy_bytes()` now sends what git
+  stores (LF; files containing a NUL byte are sent untouched) and
+  `verify_upload()` compares a SHA-256 of every file on the host. The restart
+  goes through `homeassistant.restart` (config check + clean shutdown) instead
+  of `docker restart`, whose 10 s stop timeout cut off the recorder ("could not
+  validate that the sqlite3 database … was shutdown cleanly"); the readiness
+  polls start only once the container's StartedAt has changed, because the old
+  instance still answers and still reports "loaded". Without `HA_TOKEN` it
+  falls back to `docker restart -t 260`.
 - `verify_live.py`: the PV1 ordering check compared the lifetime
   `pv1_total_energy` counter with a fixed `388.019 ± 20`, which went stale on
   its own (408.8 on 2026-10-12, nothing wrong). It now checks

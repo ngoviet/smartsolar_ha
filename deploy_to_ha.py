@@ -3,10 +3,13 @@
 Pipeline:
   1. ruff check + format --check + mypy + pytest        (refuse to ship red)
   2. archive the currently deployed files               (rollback safety)
-  3. upload every file from custom_components/smartsolar_ha/
+  3. upload every file from custom_components/smartsolar_ha/ with the line
+     endings git stores (LF), then compare a SHA-256 of every file on the host
   4. drop __pycache__ inside the container
-  5. restart Home Assistant, then wait for the API *and* for this integration's
-     config entry to reach "loaded"
+  5. restart Home Assistant through its own ``homeassistant.restart`` service
+     (config check + clean shutdown), confirm the container really restarted,
+     then wait for the API *and* for this integration's config entry to reach
+     "loaded"
 
 Usage:
     python deploy_to_ha.py            # full pipeline
@@ -17,7 +20,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -51,6 +56,21 @@ HA_READY_SECONDS = HA_READY_ATTEMPTS * (HA_READY_INTERVAL + HA_FETCH_TIMEOUT)
 # entry is still missing after this many polls there is no entry for it at all
 # (a fresh install, or a domain rename), which is reported instead of waited on.
 HA_MISSING_ENTRY_ATTEMPTS = 3
+
+# ``homeassistant.restart`` lets Home Assistant shut down cleanly; on a
+# Supervised host the Supervisor then stops the container with its own long stop
+# timeout. Waiting for the container's StartedAt to change proves the restart
+# happened: right after the service call the *old* instance still answers the
+# API and still lists the entry as "loaded".
+HA_RESTART_ATTEMPTS = 60
+HA_RESTART_POST_TIMEOUT = 30
+HA_CONTAINER = "homeassistant"
+# Only for the no-token fallback, which has to use ``docker restart``: its
+# default 10 s stop timeout killed Home Assistant before the recorder closed the
+# database ("could not validate that the sqlite3 database ... was shutdown
+# cleanly", seen after the 2026-10-12 deploy). 260 s is the Supervisor's own
+# core stop timeout.
+DOCKER_STOP_TIMEOUT = 260
 
 HA_HOST = os.environ.get("HA_HOST", "192.168.10.15")
 HA_USER = os.environ.get("HA_USER", "vokupt")
@@ -171,13 +191,29 @@ def _local_file_list() -> list[Path]:
     return sorted(p for p in SRC_DIR.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
 
 
+def deploy_bytes(path: Path) -> bytes:
+    """Return a file's content with the line endings git stores for it.
+
+    With ``core.autocrlf=true`` (the Windows default) the working tree holds
+    CRLF while the repository holds LF, and the raw bytes used to be uploaded.
+    The host then ran code that matched no commit byte for byte: 13 of 18 files
+    differed from the v2.0.7 tag by line endings alone. Text files are
+    normalised the way git normalises them; a file with a NUL byte is binary
+    (git's own heuristic) and is sent untouched, so the PNGs are not corrupted.
+    """
+    data = path.read_bytes()
+    if b"\0" in data:
+        return data
+    return data.replace(b"\r\n", b"\n")
+
+
 def upload_tree(ssh: paramiko.SSHClient) -> int:
     """Upload every file, base64 encoded, via sudo tee."""
     files = _local_file_list()
     for local in files:
         rel = local.relative_to(SRC_DIR).as_posix()
         remote = f"{REMOTE_DIR}/{rel}"
-        payload = base64.b64encode(local.read_bytes()).decode()
+        payload = base64.b64encode(deploy_bytes(local)).decode()
         remote_dir = remote.rsplit("/", 1)[0]
         run(ssh, f"sudo mkdir -p {remote_dir}")
         # Chunk so no single shell command gets unwieldy.
@@ -188,6 +224,30 @@ def upload_tree(ssh: paramiko.SSHClient) -> int:
         run(ssh, f"sudo sh -c 'base64 -d {remote}.b64 > {remote} && rm {remote}.b64'")
         print(f"  ok {rel}")
     return len(files)
+
+
+def verify_upload(ssh: paramiko.SSHClient) -> int:
+    """Compare a SHA-256 of every uploaded file with the local content.
+
+    The upload reports success per command, which says nothing about what
+    landed on the host: that is how the line-ending drift went unnoticed across
+    releases. One ``sha256sum`` over the whole set proves the host holds exactly
+    what this deploy meant to ship.
+    """
+    expected = {
+        p.relative_to(SRC_DIR).as_posix(): hashlib.sha256(deploy_bytes(p)).hexdigest() for p in _local_file_list()
+    }
+    quoted = " ".join(shlex.quote(rel) for rel in sorted(expected))
+    output = run(ssh, f"cd {REMOTE_DIR} && sudo sha256sum {quoted}")
+    actual: dict[str, str] = {}
+    for line in output.splitlines():
+        digest, _, name = line.strip().partition("  ")
+        if digest and name:
+            actual[name.lstrip("*")] = digest
+    mismatched = sorted(rel for rel, digest in expected.items() if actual.get(rel) != digest)
+    if mismatched:
+        raise RuntimeError(f"uploaded files differ from the local tree: {', '.join(mismatched)}")
+    return len(expected)
 
 
 def _remote_file_listing(ssh: paramiko.SSHClient) -> list[str]:
@@ -345,16 +405,79 @@ def _wait_for_integration(token: str) -> None:
     raise RuntimeError(f"the {INTEGRATION_DOMAIN} config entry stayed '{state or 'unknown'}' for {HA_READY_SECONDS}s")
 
 
+def _container_started_at(ssh: paramiko.SSHClient) -> str:
+    """Return the Home Assistant container's StartedAt, or "" if unreadable."""
+    _stdin, stdout, _stderr = ssh.exec_command(f"sudo docker inspect -f '{{{{.State.StartedAt}}}}' {HA_CONTAINER}")
+    out = stdout.read().decode(errors="replace").strip()
+    return out if stdout.channel.recv_exit_status() == 0 else ""
+
+
+def _request_core_restart(token: str) -> None:
+    """Call ``homeassistant.restart``: a configuration check, then a clean stop.
+
+    Home Assistant refuses the restart when the configuration is invalid; that
+    is reported instead of restarting into a broken instance. The instance going
+    down usually drops the request (reset, timeout, or a 502/503/504 from a
+    proxy): that is the restart under way, and the StartedAt check confirms it.
+    """
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        f"{HA_URL}/api/services/homeassistant/restart",
+        data=b"{}",
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=HA_RESTART_POST_TIMEOUT):
+            return
+    except urllib.error.HTTPError as err:
+        if err.code in (502, 503, 504):
+            return
+        body = err.read().decode(errors="replace").strip()
+        raise RuntimeError(f"Home Assistant refused to restart (HTTP {err.code}): {body}") from err
+    except urllib.error.URLError, TimeoutError, ConnectionError, OSError:
+        return
+
+
+def _wait_for_container_restart(ssh: paramiko.SSHClient, before: str) -> None:
+    """Wait until the container's StartedAt moves past ``before``."""
+    for _attempt in range(HA_RESTART_ATTEMPTS):
+        time.sleep(HA_READY_INTERVAL)
+        now = _container_started_at(ssh)
+        if now and now != before:
+            print(f"  container restarted at {now}")
+            return
+    raise RuntimeError(
+        f"the {HA_CONTAINER} container did not restart within "
+        f"{HA_RESTART_ATTEMPTS * HA_READY_INTERVAL}s of homeassistant.restart"
+    )
+
+
 def restart_ha(ssh: paramiko.SSHClient, env: dict[str, str]) -> None:
-    """Restart the container, then wait until the integration is really loaded."""
+    """Restart Home Assistant cleanly, then wait until the integration is loaded.
+
+    ``docker restart`` used to be issued directly: its 10 s stop timeout killed
+    Home Assistant mid-shutdown, so the recorder could not close a multi-GB
+    database and every deploy left an unclean-shutdown warning behind.
+    """
     run(ssh, f"sudo rm -rf {REMOTE_DIR}/__pycache__")
     print("  __pycache__ removed")
-    run(ssh, "sudo docker restart homeassistant > /dev/null 2>&1 || true")
-    print("  restart issued")
 
     token = env.get("HA_TOKEN")
     if not token:
+        run(ssh, f"sudo docker restart -t {DOCKER_STOP_TIMEOUT} {HA_CONTAINER} > /dev/null 2>&1 || true")
+        print(f"  restart issued via docker (no HA_TOKEN: stop timeout {DOCKER_STOP_TIMEOUT}s, not waiting)")
         return
+
+    before = _container_started_at(ssh)
+    _request_core_restart(token)
+    print("  restart requested via homeassistant.restart")
+    if before:
+        _wait_for_container_restart(ssh, before)
+    else:
+        print(f"  WARNING: could not read the {HA_CONTAINER} start time; cannot confirm the restart happened")
 
     _wait_for_api(token)
     _wait_for_integration(token)
@@ -386,6 +509,8 @@ def main() -> int:
 
         print("Uploading:")
         count = upload_tree(ssh)
+        verified = verify_upload(ssh)
+        print(f"  sha256 verified: {verified} file(s) identical to the local tree")
 
         print("Removing files that no longer exist locally:")
         stale = prune_remote(ssh)

@@ -72,15 +72,26 @@ class FakeSSH:
         tar_data: bytes = b"",
         tar_status: int = 0,
         legacy: str = "no",
+        started_at: list[str] | None = None,
+        sha256_output: str = "",
     ) -> None:
         self.commands: list[str] = []
         self.find_listing = find_listing
         self.tar_data = tar_data
         self.tar_status = tar_status
         self.legacy = legacy
+        # Container start times served in order, the last one repeated: by
+        # default the container restarts between the first and second read.
+        self.started_at = list(started_at) if started_at is not None else ["T0", "T1"]
+        self.sha256_output = sha256_output
 
     def exec_command(self, cmd: str):
         self.commands.append(cmd)
+        if cmd.startswith("sudo docker inspect"):
+            value = self.started_at.pop(0) if len(self.started_at) > 1 else self.started_at[0]
+            return None, _FakeStream(f"{value}\n".encode(), 0 if value else 1), _FakeStream()
+        if "sha256sum" in cmd:
+            return None, _FakeStream(self.sha256_output.encode()), _FakeStream()
         if cmd.startswith("sudo find"):
             return None, _FakeStream(self.find_listing.encode()), _FakeStream()
         if cmd.startswith("sudo tar"):
@@ -222,6 +233,20 @@ class TestLegacyFolderWarning:
         assert capsys.readouterr().out == ""
 
 
+@pytest.fixture
+def restart_requests(monkeypatch):
+    """Record ``homeassistant.restart`` calls instead of sending them.
+
+    The wait tests below count the GET requests of the readiness polls; the
+    restart request itself is covered by ``TestCleanRestart``.
+    """
+    sent: list[str] = []
+    monkeypatch.setattr(deploy_to_ha, "_request_core_restart", sent.append)
+    monkeypatch.setattr(deploy_to_ha.time, "sleep", lambda _seconds: None)
+    return sent
+
+
+@pytest.mark.usefixtures("restart_requests")
 class TestRestartWaitsOnConfiguredUrl:
     """The wait used to poll a hardcoded host:8123, ignoring HA_URL."""
 
@@ -256,6 +281,7 @@ class TestRestartWaitsOnConfiguredUrl:
         deploy_to_ha.restart_ha(FakeSSH(), {})  # must not raise
 
 
+@pytest.mark.usefixtures("restart_requests")
 class TestRestartWaitsForTheIntegrationToLoad:
     """The API answers before the platforms are added.
 
@@ -391,6 +417,170 @@ class TestRestartWaitsForTheIntegrationToLoad:
             deploy_to_ha.restart_ha(FakeSSH(), {"HA_TOKEN": "token"})
 
         assert "no smartsolar_ha config entry found" not in capsys.readouterr().out
+
+
+class TestDeployBytes:
+    """The host must receive what git stores (LF), not the CRLF working tree.
+
+    With ``core.autocrlf=true`` 13 of the 18 deployed files differed from the
+    v2.0.7 tag by line endings alone, so the host ran code matching no commit.
+    """
+
+    def test_text_crlf_becomes_lf(self, tmp_path):
+        path = tmp_path / "module.py"
+        path.write_bytes(b"a = 1\r\nb = 2\r\n")
+
+        assert deploy_to_ha.deploy_bytes(path) == b"a = 1\nb = 2\n"
+
+    def test_binary_files_are_sent_untouched(self, tmp_path):
+        data = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\r\n"
+        path = tmp_path / "icon.png"
+        path.write_bytes(data)
+
+        assert deploy_to_ha.deploy_bytes(path) == data
+
+    def test_no_shipped_text_file_carries_crlf(self):
+        for path in deploy_to_ha._local_file_list():
+            data = deploy_to_ha.deploy_bytes(path)
+            if b"\0" not in data:
+                assert b"\r\n" not in data, path.name
+
+
+class TestVerifyUpload:
+    """A deploy must prove the host holds exactly the bytes it meant to ship."""
+
+    @staticmethod
+    def _sha256_output(overrides: dict[str, str] | None = None) -> str:
+        import hashlib
+
+        lines = []
+        for path in deploy_to_ha._local_file_list():
+            rel = path.relative_to(deploy_to_ha.SRC_DIR).as_posix()
+            digest = hashlib.sha256(deploy_to_ha.deploy_bytes(path)).hexdigest()
+            lines.append(f"{(overrides or {}).get(rel, digest)}  {rel}")
+        return "\n".join(lines) + "\n"
+
+    def test_passes_when_every_file_matches(self):
+        ssh = FakeSSH(sha256_output=self._sha256_output())
+
+        assert deploy_to_ha.verify_upload(ssh) == len(_local_relative_paths())
+        assert ssh.commands[0].startswith(f"cd {deploy_to_ha.REMOTE_DIR} && sudo sha256sum ")
+
+    def test_a_crlf_copy_on_the_host_is_reported(self):
+        import hashlib
+
+        crlf = hashlib.sha256(b"line\r\n").hexdigest()
+        ssh = FakeSSH(sha256_output=self._sha256_output({"coordinator.py": crlf}))
+
+        with pytest.raises(RuntimeError, match=r"differ from the local tree: coordinator\.py"):
+            deploy_to_ha.verify_upload(ssh)
+
+    def test_a_file_missing_on_the_host_is_reported(self):
+        listing = "\n".join(line for line in self._sha256_output().splitlines() if not line.endswith("  const.py"))
+        ssh = FakeSSH(sha256_output=listing)
+
+        with pytest.raises(RuntimeError, match=r"const\.py"):
+            deploy_to_ha.verify_upload(ssh)
+
+
+class TestCleanRestart:
+    """``docker restart`` killed HA after 10 s, mid-way through closing the DB.
+
+    The deploy now asks Home Assistant to restart itself, and only trusts the
+    readiness polls once the container has really been restarted — right after
+    the request the old instance still answers and still reports "loaded".
+    """
+
+    @staticmethod
+    def _serve(monkeypatch, restart_outcome=None):
+        """Answer the restart POST with ``restart_outcome`` and the GETs as ready."""
+        requests: list[tuple[str, str]] = []
+
+        def fake_urlopen(request, timeout=None):  # noqa: ARG001
+            requests.append((request.get_method(), request.full_url))
+            if request.full_url.endswith("/api/services/homeassistant/restart"):
+                if isinstance(restart_outcome, Exception):
+                    raise restart_outcome
+                return _JsonResponse([])
+            if request.full_url.endswith("/api/config"):
+                return _JsonResponse({"version": "2026.10.1"})
+            return _JsonResponse([{"domain": "smartsolar_ha", "state": "loaded"}])
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(deploy_to_ha, "HA_URL", "http://ha.example:9999")
+        monkeypatch.setattr(deploy_to_ha.time, "sleep", lambda _seconds: None)
+        return requests
+
+    @staticmethod
+    def _http_error(code: int, body: bytes = b"") -> urllib.error.HTTPError:
+        import io
+
+        return urllib.error.HTTPError("http://ha.example:9999", code, "error", None, io.BytesIO(body))  # type: ignore[arg-type]
+
+    def test_uses_the_restart_service_not_docker(self, monkeypatch):
+        requests = self._serve(monkeypatch)
+        ssh = FakeSSH()
+
+        deploy_to_ha.restart_ha(ssh, {"HA_TOKEN": "token"})
+
+        assert requests[0] == ("POST", "http://ha.example:9999/api/services/homeassistant/restart")
+        assert not any("docker restart" in cmd for cmd in ssh.commands)
+
+    def test_waits_until_the_container_has_restarted(self, monkeypatch, capsys):
+        self._serve(monkeypatch)
+        ssh = FakeSSH(started_at=["T0", "T0", "T0", "T1"])
+
+        deploy_to_ha.restart_ha(ssh, {"HA_TOKEN": "token"})
+
+        assert sum(cmd.startswith("sudo docker inspect") for cmd in ssh.commands) == 4
+        assert "container restarted at T1" in capsys.readouterr().out
+
+    def test_fails_when_the_container_never_restarts(self, monkeypatch):
+        monkeypatch.setattr(deploy_to_ha, "HA_RESTART_ATTEMPTS", 3)
+        requests = self._serve(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="did not restart"):
+            deploy_to_ha.restart_ha(FakeSSH(started_at=["T0"]), {"HA_TOKEN": "token"})
+
+        assert all(method == "POST" for method, _url in requests), "the old instance must not be polled"
+
+    def test_a_refused_restart_is_reported_and_nothing_waits(self, monkeypatch):
+        requests = self._serve(monkeypatch, self._http_error(400, b"configuration check failed"))
+        ssh = FakeSSH()
+
+        with pytest.raises(RuntimeError, match=r"refused to restart \(HTTP 400\): configuration check failed"):
+            deploy_to_ha.restart_ha(ssh, {"HA_TOKEN": "token"})
+
+        assert len(requests) == 1
+        assert sum(cmd.startswith("sudo docker inspect") for cmd in ssh.commands) == 1
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            pytest.param("gateway", id="504-from-a-proxy"),
+            pytest.param(urllib.error.URLError("connection reset"), id="dropped-connection"),
+            pytest.param(TimeoutError("timed out"), id="timeout"),
+        ],
+    )
+    def test_a_dropped_request_is_the_restart_under_way(self, monkeypatch, capsys, outcome):
+        if outcome == "gateway":
+            outcome = self._http_error(504)
+        self._serve(monkeypatch, outcome)
+
+        deploy_to_ha.restart_ha(FakeSSH(), {"HA_TOKEN": "token"})
+
+        assert "smartsolar_ha is loaded" in capsys.readouterr().out
+
+    def test_without_a_token_docker_gets_a_long_stop_timeout(self, monkeypatch):
+        def explode(*_args, **_kwargs):
+            raise AssertionError("must not call the API without a token")
+
+        monkeypatch.setattr(urllib.request, "urlopen", explode)
+        ssh = FakeSSH()
+
+        deploy_to_ha.restart_ha(ssh, {})
+
+        assert f"sudo docker restart -t {deploy_to_ha.DOCKER_STOP_TIMEOUT} homeassistant" in " ".join(ssh.commands)
 
 
 class TestUploadScript:
