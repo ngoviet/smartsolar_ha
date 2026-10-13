@@ -1,0 +1,360 @@
+# smartsolar_ha — Lịch sử phiên bản
+
+> Tách khỏi `CLAUDE.md` ngày 2026-10-13 (P2.1 chuẩn hóa D:\code) — giữ nguyên nội dung. Mục lục: [../CLAUDE.md](../CLAUDE.md)
+
+## v2.0.7 — MQTT Honours the Update Frequency (2026-10-12)
+
+The devices publish ~2 MQTT messages per second and the coordinator refreshed
+every entity on each of them, capped only by a hard-coded 1 s gate
+(`MQTT_NOTIFY_THROTTLE`). The **Update Frequency** number entity (default 5 s)
+therefore only paced the HTTP poll: the entities still changed once per second.
+Measured on the reference installation: **60–75k recorder rows per day per
+sensor**, a 2.86 GB database with 7-day retention, a **4.4–5.3 MB** payload for
+one 24 h history graph, and 33 dashboard templates re-rendered every second.
+
+- **One refresh per update interval, from any source.** `async_update_listeners`
+  is overridden to stamp `time.monotonic()`; `_schedule_mqtt_notify` refreshes
+  at once only if a full interval has passed since the last refresh — poll *or*
+  MQTT — and otherwise arms a single trailing `async_call_later` for the
+  remainder. When that fires it re-checks, so a poll that published in the
+  meantime pushes the MQTT refresh back instead of doubling it.
+- **Nothing is lost.** Every message is still merged into `coordinator.data`;
+  the trailing refresh publishes the newest merged values. Daily stats still
+  update per message.
+- `MQTT_NOTIFY_THROTTLE` (1 s) is now the floor of the window, so Update
+  Frequency = 1 reproduces the old behaviour exactly.
+- **Live result** (Update Frequency set to 10 s): **~9.2k rows/day per sensor
+  (−88%)**; whole-instance recorder writes at noon 1,520 → 730 rows/min.
+- `deploy_to_ha.py` (tooling, after the tag): with `core.autocrlf=true` it
+  uploaded the CRLF working tree, so 13 of 18 files on the host differed from
+  the v2.0.7 tag by line endings alone. `deploy_bytes()` now sends what git
+  stores (LF; files containing a NUL byte are sent untouched) and
+  `verify_upload()` compares a SHA-256 of every file on the host. The restart
+  goes through `homeassistant.restart` (config check + clean shutdown) instead
+  of `docker restart`, whose 10 s stop timeout cut off the recorder ("could not
+  validate that the sqlite3 database … was shutdown cleanly"); the readiness
+  polls start only once the container's StartedAt has changed, because the old
+  instance still answers and still reports "loaded". Without `HA_TOKEN` it
+  falls back to `docker restart -t 260`.
+- `verify_live.py`: the PV1 ordering check compared the lifetime
+  `pv1_total_energy` counter with a fixed `388.019 ± 20`, which went stale on
+  its own (408.8 on 2026-10-12, nothing wrong). It now checks
+  `388.019 <= x < 900` — the counter never drops, and a PV1/PV2 swap (the other
+  device is > 1000 kWh) still fails.
+- Tests: 3 coalescing tests (fail on v2.0.6, pass now) + 5 for the
+  verify_live check — 593 passed.
+
+## v2.0.6 — A Wrong Password Asks the User (2026-09-30)
+
+The one gap v2.0.5 left: `SmartSolarAuthenticationError` was caught nowhere, so
+rejected credentials were reported as a generic update failure — one ERROR per
+poll from `login()`, and Home Assistant never asked the user for a new password.
+This release follows the documented Home Assistant pattern instead.
+
+- **Two kinds of 401 are now told apart.** `api.login()` raises the new
+  `SmartSolarInvalidCredentialsError` (a subclass, so the config flow's
+  `invalid_auth` handling and `test_connection()` are unchanged);
+  `_authed_get()` keeps raising the plain `SmartSolarAuthenticationError` when
+  the server rejects a *cached token*. The distinction matters: a stale token is
+  fixed by the next poll logging in again, while asking the user to re-enter
+  credentials that are perfectly good would be wrong.
+- **The coordinator maps only the first one to `ConfigEntryAuthFailed`.** Home
+  Assistant's `DataUpdateCoordinator` catches it, logs
+  `Authentication failed while fetching …` **once**, marks the coordinator failed
+  and calls `config_entry.async_start_reauth_if_available()` — which is what
+  shows the re-authentication dialog (`config_flow.async_step_reauth`, translated
+  since v2.0.1). Nothing is logged by our code: HA already logged it, and a
+  second line per poll is exactly the noise v2.0.5 removed.
+- The outage counters are deliberately left untouched by an auth failure, so a
+  later recovery still reports the real poll failures rather than the password
+  mistake. `async_setup_entry` needed no change: it calls `async_refresh()`,
+  which routes the exception through that same HA handler.
+
+Five tests pin it: login's 401 raises the credentials error (and is still an
+authentication error for the config flow); a rejected cached token is *not* the
+credentials error and still clears the token; the coordinator turns the
+credentials error into `ConfigEntryAuthFailed` with no WARNING and no touched
+counters; a rejected token stays a plain `UpdateFailed` so a stale token cannot
+trigger a reauth dialog; and driving the real `coordinator.async_refresh()`
+asserts the entry's `async_start_reauth_if_available` is called and the
+coordinator is marked failed.
+
+## v2.0.5 — Quiet During a Provider Outage (2026-09-30)
+
+No behaviour change to the entities: a SmartSolar outage still makes them
+`unavailable` (correct — nothing can feed them), and they still come back by
+themselves. What changed is how loudly that outage is reported, measured on the
+live instance while the provider was actually down on 2026-09-30:
+
+| Source | Before | After |
+|--------|--------|-------|
+| `api.py` retry attempts (`Request attempt 1/3 failed…`) | 59 WARNING / 10 min | DEBUG |
+| `api.py` login failure (`Login request failed…`, `Login failed with status 5xx…`) | one ERROR per poll while no valid cached token exists | DEBUG — invalid credentials deliberately stay at ERROR |
+| `coordinator.py` poll failure (`SmartSolar API error: …`) | 90 ERROR / 10 min | one WARNING when the outage starts, one INFO when it recovers, DEBUG in between |
+| `mqtt_client.py` reconnect (`MQTT connection failed…`) | 54 WARNING / 10 min | one WARNING, then DEBUG until it reconnects |
+
+That was 263 lines per 10 minutes (~38,000/day) of identical text describing a
+provider-side outage an operator can do nothing about.
+
+- `SmartSolarDataUpdateCoordinator` counts consecutive failed polls and keeps
+  `_outage_started`; the first failure logs `WARNING` naming the interval it
+  keeps retrying at, later ones `DEBUG` with the poll number, and the first
+  successful poll logs `INFO` with the failure count and the outage duration
+  (`_format_outage()` renders seconds / minutes / hours).
+- `SmartSolarMQTTClient` counts consecutive failed attempts and clean stream
+  ends in `_failed_attempts` (a `__slots__` member, so it must stay listed
+  there); `_log_connection_established()` reports a reconnection with the
+  attempt count and resets it. A failure that happens while the client is
+  already stopping is deliberately not counted.
+- `api._request_with_retry()` logs its per-attempt retries at `DEBUG`: the
+  coordinator owns the user-visible outage report, so the retry detail stays
+  available to anyone debugging at DEBUG level.
+- `api.login()` is reached once per poll whenever no valid cached token exists
+  (after an HA restart or reload during an outage, or once a token enters the
+  7-day refresh window), so its connection and 5xx failures are `DEBUG` too.
+  A rejected login (401 / non-retryable 4xx) deliberately stays at `ERROR`:
+  nothing else in the poll path surfaces bad credentials.
+
+Eleven tests pin this (five in `test_api.py`, three in `test_coordinator.py`,
+three in `test_mqtt.py`), including that a successful poll after a successful
+poll logs no recovery line, that a first connection is never called a
+reconnect, and that a refused or 5xx login writes no WARNING/ERROR while a 401
+writes exactly one ERROR.
+
+## v2.0.4 — Repository Hygiene + Deploy Fix (2026-09-28)
+
+No integration code changed: no module under `custom_components/smartsolar_ha/`
+was touched, so the domain, entity names, `unique_id`s, services and
+config-entry keys are identical to v2.0.3 and an existing entry keeps working.
+This release publishes the three commits that landed after the v2.0.3 tag, so the
+tag matches `main` exactly.
+
+- **`prune_remote()` now works on the host.** The old `find … -printf '%P\n'`
+  is rejected by HAOS's BusyBox `find`, and `|| true` hid the failure, so pruning
+  silently removed nothing; the durable invariant is under "Deploying to HA"
+  below. Verified live: the next deploy removed the two files this release
+  deletes from the host.
+- **The repository dropped dead weight.** The unused root `logo.png`, the inner
+  `custom_components/smartsolar_ha/.gitignore` and
+  `example_configuration.yaml` are gone (the last two were uploaded to the host
+  on every deploy although Home Assistant never reads them); `.gitignore` lost
+  the rules inherited from the parent repository for files that do not exist
+  here.
+- Docs: the brand-image note in this file and `KNOWLEDGE.md`'s file table were
+  refreshed for the cleanup; release notes live in GitHub Releases, audit tables
+  here.
+
+## v2.0.3 — Deploy/Verify Tooling (2026-09-28)
+
+No integration code changed — no module under `custom_components/smartsolar_ha/`
+was touched, so the domain, entity names, `unique_id`s, services and
+config-entry keys are identical to v2.0.2 and an existing entry keeps working.
+This release publishes the tooling that makes deploying and verifying the
+integration trustworthy, all of it found by deploying v2.0.2 for real:
+
+- `deploy_to_ha.py` waits for the REST API **and** for the config entry named by
+  the integration folder to report `loaded`, keeping three outcomes apart
+  (loaded / stuck / read-but-absent vs unreadable). The short version: it can no
+  longer report success without having seen `loaded`, and an unreadable listing
+  is not mistaken for an absent entry. Full semantics are in "Deploying to HA"
+  below.
+- `verify_live.py` waits (bounded, 12 × 5 s) for the state machine to settle
+  before judging, because Home Assistant writes entity states asynchronously
+  after the entry loads: 12 of the 38 entities existed at the moment `loaded` was
+  printed and the rest arrived within ~10-20 s.
+- The `[test]` extra pins `homeassistant==2026.9.4`, the version the live
+  instance runs, instead of trailing it; the suite is **567 passed, 1 skipped**.
+- Docs: the README test badge is the CI workflow badge rather than a hard-coded
+  count, and the v2.0.2 notes no longer claim a CI test-count difference that
+  does not exist (at that revision CI and a local run both reported 553 passed).
+
+## v2.0.2 — Repository Rename (2026-09-28)
+
+No integration code changed: the domain, entity names, `unique_id`s, services
+and config-entry keys are identical to v2.0.1, so an existing entry keeps
+working and no re-add is needed. This release republishes the metadata that
+named the old repository.
+
+- The GitHub repository was renamed `ngoviet/smartsolar-ha` →
+  **`ngoviet/smartsolar_ha`**, so the repository slug, the integration domain and
+  the manifest's `documentation`/`issue_tracker` finally agree. GitHub 301-
+  redirects the old slug, so existing clones and HACS installs keep resolving;
+  every README badge, link, the documented `git clone` command and the
+  `my.home-assistant.io` HACS link now use the canonical URL. The repository
+  name is still unrelated to the domain — HA resolves an integration from
+  `custom_components/<domain>/`, never from GitHub.
+- The README test badge is now the **CI workflow badge** rather than a
+  hard-coded `N passed` shield. The static figure had gone stale twice — it read
+  366 while the tree had 551, then 555 while the tree had 553 — so the badge now
+  reports the CI run itself instead of a number that has to be remembered. The
+  suite reports **567 passed, 1 skipped**.
+- Added after the release tag, still without touching integration code:
+  `deploy_to_ha.py` now waits until this integration's config entry reports
+  `loaded` before it calls the deploy done, and `verify_live.py` itself waits
+  (bounded, 12 polls × 5 s) for the entities it asserts on — because Home
+  Assistant writes entity states asynchronously, so `loaded` alone is not enough
+  to chain a verification to a deploy; and the `[test]` extra pins
+  `homeassistant==2026.9.4` — the version the live instance actually runs — so
+  the gate stops testing an older Home Assistant than production.
+- Carried over from the deploy-extra review pass (already on `main`): the
+  `deploy` extra is pinned precisely and covered by a behavioural import test
+  instead of source parsing.
+
+> The v2.0.1 section below records that audit's own numbers (tests 366 → 551).
+> The suite has grown since — the deploy-extra pass, the deploy-readiness waits,
+> the verifier's settle wait and the BusyBox `find` regression tests — so the
+> current tree reports more tests than that audit.
+
+## v2.0.1 — Second Audit (2026-09-27)
+
+Full re-audit of every module, script and workflow: 27 real bugs fixed, tests
+**366 → 551**, ruff/format/mypy still clean. Every new unit test was verified to
+FAIL against the pre-fix code (65 of them did). Two tests that *encoded* a bug
+(device mode accepting several chipset ids) were corrected as well.
+
+| # | Bug | Fix |
+|---|-----|-----|
+| 1 | **The synthesis path bypassed every value guard.** `SmartSolarProjectSynthesisSensor` read the server's `synthesisStreams` with a bare `float()`, so NaN/Infinity were published as entity states (poisoning long-term statistics — the exact failure v2.0.0 #2 fixed for the per-device path) and the per-sensor `max_value` ceiling was skipped, letting a firmware sentinel like `2147483.647` V become a voltage state | The server value now goes through the same `_convert_stream_value()` as the per-device path; an unusable value falls back to local aggregation instead of being published |
+| 2 | **`OverflowError` escaped `native_value`.** Status mapping called `int(float(value))` guarded only by `except (ValueError, TypeError)`: `int(float("inf"))` raises `OverflowError`, and `int(nan)` raises `ValueError` in the synthesis path. One malformed status stream turned into an entity update error | New `_status_text()` maps through `coerce_float()` (which rejects every non-finite value), so the `int()` below is total; both paths use it |
+| 3 | `api._normalize_device_guids()` iterated `data.get("deviceLogs", []) or []` directly, so `"deviceLogs": 5` raised `TypeError` and **failed the whole poll** — the same bug class v2.0.0 #1 fixed for the coordinator, sensors and diagnostics | Uses the shared `helpers.device_logs()` |
+| 4 | **MQTT reconnected in a tight loop.** `_message_loop` only slept in the exception path, so a broker that closed the subscription *cleanly* sent the client straight back into connect, hammering a broker shared by every SmartSolar customer | A clean stream end now waits `MQTT_RECONNECT_DELAY` like a failure does |
+| 5 | **Cancellation during the reconnect backoff skipped the cleanup tail.** The `await asyncio.sleep()` sat *inside* the `except` handler, so a `CancelledError` there propagated past `self._connected = False` / `self._client = None`, leaving diagnostics reporting a live connection and a dead client reference | The whole loop is wrapped in `try/finally`; `stop()` also clears `_client` |
+| 6 | **`async_step_reconfigure` wrote credentials without validating them.** A blank field was stored as-is, and the next reload then failed `async_setup_entry`'s required-key check — so reconfiguring with an empty password silently took a working integration down. A typo was written just as blindly | Blank fields are rejected (`username_required` / `password_required`) and the credentials are proven with `test_connection()` before anything is written; reauth already did this |
+| 7 | **The `refresh_token` service outlived its config entry.** It is registered in `async_setup_entry`, and Home Assistant only removes services an integration removes itself — so after deleting the integration the service stayed in the registry and every call raised `ServiceValidationError` | `async_unload_entry` removes it once no other entry of the domain remains |
+| 8 | `verify_live.py` crashed with an uncaught `TypeError`/`AttributeError` on `"deviceLogs": null` (or a non-mapping entry) — the same payload the integration treats as "no device logs", in a script whose job is to *report*, not traceback | Defensive list handling and a wider `except` |
+| 9 | **The reauth and reconfigure dialogs had no translations.** Both `async_show_form()` calls used step ids that `strings.json`/`translations/*.json` never declared, and `async_abort(reason="unknown_entry")` had no translation either, so the UI showed raw field keys and reason strings | Added `reauth`, `reconfigure` and `unknown_entry` to `strings.json`, `en.json` and `vi.json`; a test asserts all three files declare every step id the flow shows |
+| 10 | `manifest.json` carried a **`brand` block that does nothing**: Home Assistant has no such manifest key, branding comes from a `custom_components/<domain>/brand/` folder (`loader.Integration.has_branding`), and the referenced `logo.png`/`icon.png` were not in that folder and gitignored | Removed the dead key and shipped real `brand/icon.png` (256), `brand/icon@2x.png` + `brand/logo.png` (512) from the existing 512×512 logo, re-included in `.gitignore` (those exceptions are no longer needed — see the brand note above) |
+| 11 | `clear_entities.ps1` could **corrupt Home Assistant's registries**: a `Where-Object` pipeline unrolls a single result into a scalar, so `ConvertTo-Json` wrote `"entities": { ... }` — or `"entities": null` when everything was removed — where HA requires a list. It also only matched the *current* domain, so the legacy `smartsolar_mppt` entities/devices it exists to clean were left behind, and `Set-Content -Encoding UTF8` writes a BOM that breaks HA's JSON parsing | Every assignment is wrapped in `@()`; both domains are matched (by identifier *domain*, not by `-notmatch` on an array); UTF-8 without BOM; refuses to run while HA still answers on its API, because HA rewrites `.storage` on shutdown and would discard the edit |
+| 12 | Deploy/upload scripts: `restart_ha` hardcoded `http://{HA_HOST}:8123` so a configured `HA_URL` was ignored (and `HA_URL` was otherwise dead code); `archive_remote` discarded tar's exit status and reported "archived 0 bytes" for a failed archive, silently leaving **no rollback point**; `upload_to_ha.py` died with `KeyError: 'HA_PASS'` before printing anything | `restart_ha` uses `HA_URL`; the archive warns loudly when there was nothing to archive; the legacy `smartsolar_mppt` folder on the host is now detected and reported; a missing `HA_PASS` reports instead of raising |
+| 13 | **`async_migrate_entry` could fail or corrupt an entry.** Iterating a legacy scalar `chipset_ids` raised `TypeError`, so the migration never completed and the entry stayed at v1.1; a comma-separated *string* was iterated per character, turning `"547611,14756976"` into `["5", "4", "7", …]` | `_normalize_chipset_ids()` splits strings on commas and always stores a list (a scalar becomes `[]` instead of an un-iterable value) |
+| 14 | **A zero/negative `update_interval` produced a tight polling loop.** The value comes from plain JSON on disk, and `DataUpdateCoordinator._schedule_refresh` schedules the next poll *in the past* for interval 0 — so a hand-edited entry hammered the cloud API. Garbage (`"abc"`, a bool) raised `TypeError` during setup | `_resolve_update_interval()` clamps to the same 1-30 s range the Number entity enforces, and falls back to the default for non-numeric values |
+| 15 | **MQTT credentials were only read from the first device.** They are per-*server* credentials carried in `/Device/Status`, so one offline charger (or one whose payload omits `mqttConnection`) silently disabled real-time updates for the entire project | Up to `MQTT_CREDENTIAL_ATTEMPTS` (3) devices are probed, with per-device debug logging; the bound keeps a large project from making one call per device |
+| 16 | **`discovered_devices` grew forever, so a removed device kept coming back.** The set is both the "is this ours?" guard for a shared broker and the switch that lets a cached MQTT payload be merged into the response — as a union it accepted a device the project had dropped, and that device's last MQTT values re-created a phantom `deviceLogs` entry (and were summed into the project totals) on every poll, forever | The set is replaced with the current response each poll; `chipset_ids` remains the independent config-based fallback |
+| 17 | **`UpdateIntervalNumber` mangled values it accepted.** `int(10.7)` silently became 10, and both `int()` and `round()` raise on NaN/Infinity — which Home Assistant's `number.set_value` lets through, because NaN passes its min/max check (every NaN comparison is False). The restore path's `int(float("inf"))` raised `OverflowError`, aborting the entity being added | `coerce_float()` rejects non-finite/non-numeric input with a warning, then the value is **rounded** to the nearest whole second |
+| 18 | **The deploy only ever added files.** A module deleted or renamed in the repository stayed on the HA host forever, so the deployed tree silently drifted from the repository | `prune_remote()` deletes remote files that no longer exist locally (byte-code caches excluded, and only inside this integration's own folder) |
+| 19 | `mqtt_client` used the legacy `asyncio.get_event_loop()` inside a coroutine, and rebuilt a frozenset of bookkeeping field names **for every payload** on a ~2 msg/s/device hot path | `asyncio.get_running_loop()`; the set is a module-level `BOOKKEEPING_FIELDS` constant |
+| 20 | Corrupted source text and stale comments: `const.py` held the mojibake comment `# S?c MPPT M?nh Qu?n`, and the retry comment claimed "1s, 2s, 4s" backoff while `RETRY_MAX_ATTEMPTS = 3` only produces 1s then 2s. `.gitignore` listed the Python-cache rules twice | Comment corrected and re-encoded (the trees already ship Vietnamese text elsewhere); comment states the real delays; duplicate block removed |
+| 21 | **A failed HTTP poll blanked out entities that MQTT was still feeding.** `CoordinatorEntity.available` is just `last_update_success`, so during a cloud outage every entity reported `unavailable` while `native_value` kept returning live MQTT readings — the values were computed, then discarded by the state machine and the recorder. The interval `number` disappeared too, so the one setting a user might change *because* of an outage could not be changed | `SmartSolarSensor.available` is true when the poll succeeded **or** live MQTT data can feed that entity; the `number` entity is always available (`coordinator.has_live_mqtt_data()`) |
+| 22 | **A failing platform setup leaked everything already created.** Home Assistant does not call `async_unload_entry` for an entry whose setup failed (it retries setup), so the coordinator's poll timer + midnight listener, the aiohttp session and the MQTT task survived each attempt — and every retry added another poll timer against the cloud API. A missing `mode` reached that path as a bare `KeyError` from inside sensor.py, and HA's own `async_forward_entry_setups` does **not** roll back the platforms that already succeeded | `mode` is validated up front; the platform forward is wrapped, unloads the partially set-up platforms and runs a shared `_async_teardown()`; `async_unload_entry` also unloads platforms **before** tearing anything down, so a refused unload no longer leaves a half-dead entry |
+| 23 | **Legacy metric names inside MQTT `dataStreams` were silently dropped.** The flat payload format was mapped through `MQTT_FIELD_MAPPING`, but the `dataStreams` branch stored names verbatim — so firmware publishing `charging_power` / `yield_today` / `yield_total` inside `dataStreams` had every one of those values filed under a name no sensor reads. A non-string stream name also raised inside the dict assignment | The dataStreams branch applies the same mapping (a no-op for REST-named streams) and skips non-string names |
+| 24 | **Three declared tool versions could not run this repository's own gate.** `ruff>=0.4` (dev extra *and* ci.yml) cannot parse `target-version = "py314"` at all — it exits 2 with a TOML parse error — and predates PEP 758; `mypy>=1.9` reports 5 errors on the very sources `mypy 2.x` accepts; and `.pre-commit-config.yaml` pinned `ruff-pre-commit` at `v0.4.0`, so **every commit failed the hook** with exit 2. `.pre-commit-config.yaml` is version-checked by a test now | Floors raised to the verified toolchain (`ruff>=0.16`, `mypy>=2.3`, `pytest-asyncio>=1.0` for the 1.x-only ini options), pre-commit rev bumped to `v0.16.9`, and ci.yml installs `.[test,dev]` so the floors live in pyproject.toml only — pinned by `TestToolingFloors` |
+| 25 | **Device mode accepted several chipset ids and published the wrong device's data.** Only `chipset_ids[0]` is ever read (the API call, the sensor prefix, the daily-stats key), so extra ids were silently ignored — but they still passed the MQTT "is this ours?" guard, and device mode merges every accepted device into one `lastMessage.dataStreams`. The second charger's live readings therefore appeared on the first charger's sensors | The config flow refuses more than one id in device mode (`single_chipset_id_required`, translated in all three languages) **and** `_is_tracked_device()` is mode-aware, so an entry that already carries stray ids cannot show wrong data either |
+| 26 | **`device_types` was dead entry data.** `async_step_project_devices` wrote it into every such entry, but nothing ever read it, and it duplicated `device_type` — so project-by-devices entries had a different shape from every other flow's, contravening the documented config-key contract | Removed; a test now pins the entry-data keys to the documented set |
+| 27 | **`async_step_reauth` did not validate blank fields**, unlike `async_step_user`. Blanks were sent to the API, which reported `invalid_credentials` — or `cannot_connect` when the API happened to be down, hiding the real problem behind a connectivity error | Same blank-field checks as every other entry point (`username_required` / `password_required`), before any API call |
+
+Round 4 also audited the *tests*: two of them (`test_successful_device_entry`,
+`test_device_chipset_ids_unique_id_includes_device_type`) asserted the buggy
+device-mode-multi-id behaviour and were corrected, which is how the check that
+"a test locks in a bug" was found in round 2 as well.
+
+**Rounds 5-6 (saturation pass) found no further code bugs.** Those rounds
+checked, and cleared, the remaining surface:
+
+- **No Home Assistant warnings at all** during a real setup in both modes (every
+  entity state was written and logged first): no `state_class`/`device_class`
+  conflict, no unit mismatch, no name/`has_entity_name` complaint.
+- **A systematic sweep for unsafe conversions** (`float()`/`int()`/`round()`, and
+  every loop over cloud/MQTT data) — no remaining unguarded conversion.
+- **No `TODO`/`FIXME`/`HACK` markers**, and every remaining `smartsolar_mppt`
+  string is deliberate (legacy-folder detection, live entity-id prefix).
+- **The complete audit diff was re-read** for logical errors in the fixes
+  themselves; none found. Two things were considered and left alone as
+  deliberate: `_is_tracked_device()`/`sensor.py` iterate `chipset_ids` without
+  `as_list()` on purpose — a corrupt scalar now produces a clean logged setup
+  failure plus rollback, whereas silently coercing it would create an integration
+  with no entities at all; and `hass.data[DOMAIN]` in `async_unload_entry` is not
+  `.get()`, because Home Assistant only calls unload for an entry that was
+  loaded, which implies `async_setup` ran.
+- **Test isolation and ordering**: every test file passes in its own process, and
+  a different file order passes too — no cross-test state leakage.
+- **Docs audited as user-facing behaviour**: the README test badge was stale
+  (366), its changelog had no v2.0.1 entry, and two historical bullets claimed
+  things that were never true (`allow_multiple_instances` is not a Home Assistant
+  attribute; the sensors do **not** restore a stale value). Fixed, and
+  `KNOWLEDGE.md`'s version banner was updated.
+
+Also: `helpers.coerce_float()` now backs every numeric conversion in
+`sensor.py` (the manual `float()` + `math.isfinite` pair is gone, so the
+`import math` went with it); `__init__.py` type-checks `mqttConnection` before
+calling `.get()` on it (a non-mapping used to surface as a generic "MQTT setup
+failed"); the docs' claim that a late-discovered device "gets entities" was
+wrong — **no entities are created after setup** (deliberate: per-device sensors
+are numbered from the sorted GUID order, so a new device with a lower GUID would
+renumber existing entity_ids and break dashboards).
+
+Not changed, deliberately: the daily-stats average is an unweighted mean over
+samples (MQTT publishes ~2 Hz and the poll adds one more), so `avg_power_today`
+is a sample mean rather than a time-weighted one; and `diagnostics` still reports
+the account `username` — there is an explicit test asserting that, since the
+username is what makes a diagnostics dump traceable to an account, while the
+password and token are redacted.
+
+## v2.0.0 — Domain Rename + Audit Fixes
+
+`smartsolar_mppt` → **`smartsolar_ha`** (folder, `manifest.domain`,
+`const.DOMAIN`, imports, deploy/verify paths, docs). HA resolves an integration
+as `custom_components/<domain>/manifest.json` and restricts the domain to
+lowercase letters and underscores, so a hyphenated name such as `smartsolar-ha`
+is not a valid *domain*, and renaming without changing the domain would make HA
+fail to find the integration. (The GitHub repository name is unrelated — it
+happens to be `smartsolar_ha` too, but HA never reads it.) Existing config
+entries must be re-added; entity names were left alone so entity_id / dashboards
+/ statistics survive. Tests: 261 → 366.
+
+| # | Bug | Fix |
+|---|-----|-----|
+| 1 | `"deviceLogs": null` from the API **failed the whole poll** (`UpdateFailed: object of type 'NoneType' has no len()`) — the `len()` sat in a debug statement, and debug arguments are evaluated even when debug logging is off | Shared `helpers.device_logs()` / `as_list()` used by coordinator, sensors and diagnostics |
+| 2 | **NaN/Infinity reached entity states.** `json.loads` accepts bare `NaN`/`Infinity`, NaN survives every `> max_value` check, and a NaN state poisons that sensor's long-term statistics | `coerce_float()` rejects non-finite values; `_convert_stream_value()` checks `math.isfinite` |
+| 3 | A **server-rejected token was cached forever** — 401 did not invalidate it, and the ~30-day expiry kept `refresh_token_if_needed()` from re-authenticating, so every poll failed until HA restarted | `_authed_get()` clears token + expiry on 401 so the next call logs in again |
+| 4 | A **non-object JSON body** (list, HTML error page) escaped as `AttributeError` / `JSONDecodeError` and was unclassified | `_json_object()` normalizes both into `SmartSolarAPIError` |
+| 5 | **408/429 were treated as permanent failures** and never retried | Added to `RETRYABLE_STATUSES`; 4xx client errors still fail fast |
+| 6 | Per-sensor `WARNING` on every poll (plus 1 Hz per MQTT message) when the cloud returned no device logs → log flood | Downgraded to `DEBUG` |
+| 7 | MQTT `null` fields were written into `dataStreams` as the string `"None"`, shadowing the real REST value | `_mqtt_to_data_stream()` drops `None` values |
+| 8 | `SmartSolarMQTTClient.connected` stayed `True` after `stop()` / a finished message loop → diagnostics reported a live connection that did not exist | Flag cleared in `stop()` and on loop exit |
+| 9 | The `refresh_token` service accepted a **missing `entry_id`** and silently did nothing (contradicting `services.yaml`) | `vol.Required("entry_id")` + `ServiceValidationError` for an unknown entry |
+| 10 | `allow_multiple_instances = True` in the config flow is **not a Home Assistant attribute** (verified against `config_entries.py` in 2026.9.2, re-checked in 2026.9.4) — dead, misleading code | Removed; multiple entries are allowed because the manifest omits `single_config_entry` |
+| 11 | `verify_live.py` **crashed with a traceback** (instead of reporting FAIL) whenever a state was `unknown`/`unavailable`, and on a missing `HA_TOKEN` | `as_float()` helper, plus explicit messages for a missing token / unreachable instance |
+| 12 | The local deploy gate linted **fewer files than CI** (`upload_to_ha.py` only, so `deploy_to_ha.py`/`verify_live.py` were unchecked) | One shared `SOURCES` list mirrored in `ci.yml` |
+| 13 | Test fixtures handed out **shallow copies** of the recorded payloads while the coordinator merges MQTT data in place → cross-test contamination (two tests only passed because they compared against an object the code had already mutated) | `deepcopy` in `conftest.py` and at every mutation site; `TestFixtureIsolation` in `test_coordinator.py` |
+
+Also fixed: `datetime.now()` → `dt_util.now()` for daily-stats minute buckets
+(HA-local time, consistent with the midnight reset listener); `pyproject.toml`
+now states the real Python floor (`>=3.14.2`, matching HA 2026.x) and
+`ruff target-version = "py314"` (which is why `except A, B:` appears — PEP 758);
+the inner `custom_components/*/hacs.json` was deleted (HACS only reads the
+repository-root `hacs.json`, and that copy disagreed with it).
+
+## v1.5.1 — Audit Fixes (2026-09-27)
+
+Full audit: 12 real bugs fixed, ruff + mypy clean for the first time, tests
+raised from 121 to 261. `mypy` used to be run with `|| true` in CI, hiding 29
+type errors; it is now a hard gate.
+
+| # | Bug | Fix |
+|---|-----|-----|
+| 1 | **HA was running a stale build** (1.3.0: no stats sensors, `sw_version` 1.3.0) while the repo had newer code | Deployed the current tree; version bumped to 1.5.1 across manifest/pyproject/`const.VERSION` |
+| 2 | Project battery voltage could be **summed** (26.6 + 26.4 = 53 V) | Per-sensor `AGGREGATION`; voltage/temperature average |
+| 3 | Synthesis `status` was **always None** — status was mapped to text before aggregation | Aggregate the numeric code, map to text afterwards |
+| 4 | `DataUpdateCoordinator.async_shutdown` is a **coroutine** and was not awaited on unload → poll timer + midnight listener leaked on every reload | `await coordinator.async_shutdown()` |
+| 5 | `_request_with_retry` was **dead code** — no API call used it, so the documented retry/backoff never ran | All GETs go through `_authed_get` → `_request_with_retry` |
+| 6 | API could return a **naive** token expiry → `TypeError` on compare, killing token refresh | `_parse_expiration()` always returns a tz-aware datetime |
+| 7 | MQTT messages from **any** SmartSolar customer could be injected into our deviceLogs (shared broker) | `_is_tracked_device()` guard; `+/#` never subscribed, wildcard kept per-device |
+| 8 | Malformed `deviceLogs`/`dataStreams` entries raised `AttributeError`/`KeyError` inside the MQTT merge | Every element type-checked; `_merge_streams` skips junk |
+| 9 | Per-device WiFi sensor read only `dataStreams`, but REST reports `signalQuality` at the **deviceLog top level** | `_device_log_value()` checks dataStreams then the deviceLog field |
+| 10 | Empty `dataStreams: []` payload silently **dropped every other field** | An empty list is treated as "absent" and the flat format is used |
+| 11 | `today_kwh` declared `state_class: measurement` with `device_class: energy` → HA logged a warning per entity and built **no statistics** | `total_increasing` (the device's midnight reset is a meter cycle) |
+| 12 | `UpdateIntervalNumber` claimed `RestoreEntity` in docs but did not inherit it; out-of-range values were accepted | Inherits `RestoreEntity`, restores on add, rejects values outside 1–30 |
+
+Also fixed: PV1/PV2 labels are pinned to the **sorted GUID order** (the server's
+`deviceLogs` order is not stable, which used to shuffle entity_ids and break
+dashboards); `config_flow` closes the cached API client on every terminal path
+(success, error, and the duplicate-entry abort) and rebuilds it whenever the
+submitted credentials change, so a corrected retry never reuses a stale session;
+`async_migrate_entry` refuses a newer entry version instead of pretending success;
+`diagnostics.py` redacts secrets and no longer touches private coordinator
+attributes; logger names moved to `const.py` so noisy sub-loggers can be silenced.
+
+> **Known, correct limitation:** the 40A charger (GUID `14756976`) never reports
+> WiFi signal — the live API returns `signalQuality: null` for it and its
+> firmware publishes the older `updateDeviceLog` MQTT format without the field.
+> `sensor.…_pv2_wifi_signal` is therefore legitimately `unknown`.
