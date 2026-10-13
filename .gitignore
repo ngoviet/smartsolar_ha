@@ -61,3 +61,14 @@ _local_archive/
 .playwright-mcp/
 .mcp.json
 AGENTS.md
+
+# --- nền D:\code (System_info/templates/dcode/gitignore-base) ---
+.env.*
+!.env.example
+logs/
+tmp/
+*.log.err
+*.bak*
+*.old
+node_modules/
+desktop.ini
