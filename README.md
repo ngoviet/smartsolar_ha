@@ -1,4 +1,6 @@
-# SmartSolar MPPT — Home Assistant Integration
+# SmartSolar MPPT for Home Assistant
+
+<!-- readme-axi type=ha -->
 
 [![GitHub release](https://img.shields.io/github/release/ngoviet/smartsolar_ha.svg)](https://github.com/ngoviet/smartsolar_ha/releases)
 [![CI](https://github.com/ngoviet/smartsolar_ha/actions/workflows/ci.yml/badge.svg)](https://github.com/ngoviet/smartsolar_ha/actions/workflows/ci.yml)
@@ -7,17 +9,30 @@
 [![Python](https://img.shields.io/badge/python-3.14.2%2B-blue)](https://www.python.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[![Open your Home Assistant instance and add this repository to HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=ngoviet&repository=smartsolar_ha&category=integration)
+**English** · [Tiếng Việt](README.vi.md)
 
 Custom integration for **SmartSolar MPPT** solar charge controllers. It reads
 live metrics from the SmartSolar cloud API and from the SmartSolar MQTT broker,
 exposes them as Home Assistant sensors, and keeps the values flowing from
 whichever source is available.
 
-- **Current version:** v2.0.7 — verified live against **HA 2026.10.1** (2026-10-12); every release is deployed to the reference installation and checked with `verify_live.py` right after its tag
-- **Test suite:** the CI badge above is always current — ruff, format, mypy and pytest are hard gates, run with the `[test]` extra against the pinned Home Assistant version
+[![Open your Home Assistant instance and add this repository to HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=ngoviet&repository=smartsolar_ha&category=integration)
 
----
+> 🇻🇳 Built and maintained by one person in Việt Nam — if it saves you time, please
+> [support the project](#support-the-project).
+
+## Contents
+
+- [Features](#features)
+- [Supported devices](#supported-devices)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Entities](#entities)
+- [Services](#services)
+- [Troubleshooting](#troubleshooting)
+- [How it works](#how-it-works)
+- [Development](#development)
 
 ## Features
 
@@ -45,6 +60,17 @@ whichever source is available.
 
 Other SmartSolar controllers that publish to the same cloud API and broker work
 too — the integration does not hard-code model names.
+
+## Requirements
+
+- Home Assistant **2026.9** or newer (`hacs.json` declares `2026.9.0`)
+- Python **3.14.2+** (required by Home Assistant 2026.x)
+- `aiohttp >= 3.8.0` and `aiomqtt >= 2.0` — declared in the manifest, installed
+  by Home Assistant. If `aiomqtt` cannot be imported, the integration still works
+  through REST polling.
+- A SmartSolar account registered at [smartsolar.io.vn](https://smartsolar.io.vn)
+
+**Current version:** v2.0.7 — verified live against **HA 2026.10.1** (2026-10-12); every release is deployed to the reference installation and checked with `verify_live.py` right after its tag.
 
 ## Installation
 
@@ -74,6 +100,25 @@ git clone https://github.com/ngoviet/smartsolar_ha.git smartsolar_ha
 > folder name, so an old entry cannot load under the new name. Migrate the stored
 > entry instead of deleting it — see
 > [Migration from v1.x](#migration-from-v1x).
+
+### Migration from v1.x
+
+v2.0.0 renamed the integration and its domain from `smartsolar_mppt` to
+`smartsolar_ha`, because Home Assistant requires the integration folder to equal
+`manifest["domain"]` and a domain may contain only lowercase letters and
+underscores. (The GitHub repository name is unrelated — Home Assistant never
+reads it.)
+
+An existing entry cannot load under the new domain. Two options:
+
+- **Migrate the entry in place (recommended).** Rewrite the domain in
+  `core.config_entries`, `core.entity_registry` and `core.device_registry` while
+  Home Assistant is stopped. The `entry_id` stays the same, so every unique ID,
+  entity ID, dashboard and long-term statistic survives. The exact procedure is
+  in `CLAUDE.md` → "Deploying to HA".
+- **Delete and re-add.** Simpler, but it creates a new `entry_id`, so entity IDs
+  gain `_2` suffixes, dashboards need updating and long-term statistics are
+  orphaned.
 
 ## Configuration
 
@@ -159,6 +204,55 @@ cloud's synthesis values for them are frequently absent.
 |--------|-------|-------|
 | Update Frequency | 1–30 s | Restores its own value after a restart; always available |
 
+## Services
+
+| Service | Fields | Description |
+|---------|--------|-------------|
+| `smartsolar_ha.refresh_token` | `entry_id` (required) | Force an immediate token refresh for one config entry |
+
+## Troubleshooting
+
+| Symptom | What to check |
+|---------|---------------|
+| No sensor data | Credentials are valid and the device is online in the SmartSolar app; check the integration's INFO logs |
+| Home Assistant asks you to re-authenticate | The account password was rejected (changed or revoked). Enter the new password in the prompt — the entities stay `unavailable` until you do, and nothing else needs reconfiguring |
+| Integration does not load | `manifest.json` requires `aiohttp` and `aiomqtt`; check the Home Assistant log for the loader error |
+| Cloud errors (502/503/timeouts) | The SmartSolar cloud is temporarily unavailable — polls retry with backoff, and MQTT-fed sensors keep updating |
+| Token problems | Tokens refresh automatically; the `smartsolar_ha.refresh_token` service forces a refresh for one entry |
+| MQTT never connects | Outbound WSS to `mqttx.smartsolar.io.vn:8084` must be allowed; the integration keeps polling over REST regardless |
+| Entities `unavailable` during a cloud outage | Should not happen any more: a sensor is available when the poll **or** live MQTT data can feed it |
+| WiFi Signal `unknown` | Normal for firmware that does not publish `signalQuality` (see limitations) |
+| Device added to the project but not visible | Restart Home Assistant: entity sets are fixed at setup time |
+
+### Known limitations and deliberate behaviour
+
+These are choices, not bugs — each is covered by tests:
+
+- **A device that first appears after setup gets no entities.** The MQTT
+  subscription set and the entity set are fixed at setup time. Per-device
+  sensors are labelled `PV1`, `PV2`, … from the numerically sorted GUIDs, so
+  inserting a device with a lower GUID would renumber existing entity IDs and
+  break dashboards. Restart Home Assistant after adding a controller.
+- **`Avg Power Today` is a sample mean**, not a time-weighted average: MQTT
+  publishes at roughly 2 Hz and each poll adds one more sample.
+- **`WiFi Signal` stays `unknown` for some firmware.** The 40A unit in the
+  reference installation never reports `signalQuality` (the API returns `null`
+  and its MQTT payloads use the older format without the field).
+- **Sensors do not restore stale values** after a restart. They inherit
+  `RestoreEntity`, but a sensor shows `unknown` until the first poll or MQTT
+  message, because a restored reading could be arbitrarily old. Only `Update
+  Frequency` restores its own value.
+- **During a SmartSolar outage the entities go `unavailable`, and the log stays
+  quiet.** A sensor is available when the poll **or** live MQTT can feed it, so
+  when the provider is unreachable both paths are down and there is nothing to
+  publish. The integration reports that once (one `WARNING` + one `INFO` when it
+  recovers); it does not repeat the failure every poll. A **rejected password**
+  is treated differently on purpose: it asks Home Assistant to start its
+  re-authentication flow instead of retrying as if it were an outage. See the
+  release notes under [Releases](https://github.com/ngoviet/smartsolar_ha/releases).
+- **Diagnostics include the account username** (and redact password and token),
+  so that a diagnostics dump can be traced to an account.
+
 ## How it works
 
 ```
@@ -201,55 +295,6 @@ cloud's synthesis values for them are frequently absent.
   rejected in the callback.
 - A dropped connection reconnects after 5 s; REST polling continues meanwhile.
 
-## Services
-
-| Service | Fields | Description |
-|---------|--------|-------------|
-| `smartsolar_ha.refresh_token` | `entry_id` (required) | Force an immediate token refresh for one config entry |
-
-## Known limitations and deliberate behaviour
-
-These are choices, not bugs — each is covered by tests:
-
-- **A device that first appears after setup gets no entities.** The MQTT
-  subscription set and the entity set are fixed at setup time. Per-device
-  sensors are labelled `PV1`, `PV2`, … from the numerically sorted GUIDs, so
-  inserting a device with a lower GUID would renumber existing entity IDs and
-  break dashboards. Restart Home Assistant after adding a controller.
-- **`Avg Power Today` is a sample mean**, not a time-weighted average: MQTT
-  publishes at roughly 2 Hz and each poll adds one more sample.
-- **`WiFi Signal` stays `unknown` for some firmware.** The 40A unit in the
-  reference installation never reports `signalQuality` (the API returns `null`
-  and its MQTT payloads use the older format without the field).
-- **Sensors do not restore stale values** after a restart. They inherit
-  `RestoreEntity`, but a sensor shows `unknown` until the first poll or MQTT
-  message, because a restored reading could be arbitrarily old. Only `Update
-  Frequency` restores its own value.
-- **During a SmartSolar outage the entities go `unavailable`, and the log stays
-  quiet.** A sensor is available when the poll **or** live MQTT can feed it, so
-  when the provider is unreachable both paths are down and there is nothing to
-  publish. The integration reports that once (one `WARNING` + one `INFO` when it
-  recovers); it does not repeat the failure every poll. A **rejected password**
-  is treated differently on purpose: it asks Home Assistant to start its
-  re-authentication flow instead of retrying as if it were an outage. See the
-  release notes under [Releases](https://github.com/ngoviet/smartsolar_ha/releases).
-- **Diagnostics include the account username** (and redact password and token),
-  so that a diagnostics dump can be traced to an account.
-
-## Troubleshooting
-
-| Symptom | What to check |
-|---------|---------------|
-| No sensor data | Credentials are valid and the device is online in the SmartSolar app; check the integration's INFO logs |
-| Home Assistant asks you to re-authenticate | The account password was rejected (changed or revoked). Enter the new password in the prompt — the entities stay `unavailable` until you do, and nothing else needs reconfiguring |
-| Integration does not load | `manifest.json` requires `aiohttp` and `aiomqtt`; check the Home Assistant log for the loader error |
-| Cloud errors (502/503/timeouts) | The SmartSolar cloud is temporarily unavailable — polls retry with backoff, and MQTT-fed sensors keep updating |
-| Token problems | Tokens refresh automatically; the `smartsolar_ha.refresh_token` service forces a refresh for one entry |
-| MQTT never connects | Outbound WSS to `mqttx.smartsolar.io.vn:8084` must be allowed; the integration keeps polling over REST regardless |
-| Entities `unavailable` during a cloud outage | Should not happen any more: a sensor is available when the poll **or** live MQTT data can feed it |
-| WiFi Signal `unknown` | Normal for firmware that does not publish `signalQuality` (see limitations) |
-| Device added to the project but not visible | Restart Home Assistant: entity sets are fixed at setup time |
-
 ## Development
 
 ```bash
@@ -265,6 +310,8 @@ py -3.14 -m venv .venv                       # Home Assistant 2026.x needs Pytho
 The `[test]` extra pins `homeassistant==2026.9.4` — the version the integration
 is verified against and the version the reference installation runs. The
 `[deploy]` extra (`paramiko`) is only needed by the SSH helper scripts.
+
+**Test suite:** the CI badge above is always current — ruff, format, mypy and pytest are hard gates, run with the `[test]` extra against the pinned Home Assistant version.
 
 ### The same gate runs locally and in CI
 
@@ -313,35 +360,7 @@ tests/                 Unit, script and end-to-end tests (see the CI badge for t
 `CLAUDE.md` documents the architecture decisions and every audit fix in detail;
 `KNOWLEDGE.md` is the Vietnamese deep-dive on the cloud API and the MQTT broker.
 
-## Migration from v1.x
-
-v2.0.0 renamed the integration and its domain from `smartsolar_mppt` to
-`smartsolar_ha`, because Home Assistant requires the integration folder to equal
-`manifest["domain"]` and a domain may contain only lowercase letters and
-underscores. (The GitHub repository name is unrelated — Home Assistant never
-reads it.)
-
-An existing entry cannot load under the new domain. Two options:
-
-- **Migrate the entry in place (recommended).** Rewrite the domain in
-  `core.config_entries`, `core.entity_registry` and `core.device_registry` while
-  Home Assistant is stopped. The `entry_id` stays the same, so every unique ID,
-  entity ID, dashboard and long-term statistic survives. The exact procedure is
-  in `CLAUDE.md` → "Deploying to HA".
-- **Delete and re-add.** Simpler, but it creates a new `entry_id`, so entity IDs
-  gain `_2` suffixes, dashboards need updating and long-term statistics are
-  orphaned.
-
-## Requirements
-
-- Home Assistant **2026.9** or newer (`hacs.json` declares `2026.9.0`)
-- Python **3.14.2+** (required by Home Assistant 2026.x)
-- `aiohttp >= 3.8.0` and `aiomqtt >= 2.0` — declared in the manifest, installed
-  by Home Assistant. If `aiomqtt` cannot be imported, the integration still works
-  through REST polling.
-- A SmartSolar account registered at [smartsolar.io.vn](https://smartsolar.io.vn)
-
-## Contributing
+### Contributing
 
 Issues and pull requests are welcome.
 
@@ -351,25 +370,6 @@ Issues and pull requests are welcome.
 
 Please run the local gate above before opening a pull request; CI runs the same
 checks and adds HACS validation.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
----
-
-## Support
-
-If this integration helps you monitor your solar energy, consider supporting its
-development:
-
-**BSC / BNB Smart Chain (BEP20)**
-```
-0x57f07d44fb581cddc028a0c67d63a8cc05aa6caa
-```
-Accepts: BTC, ETH, USDT, BNB, USDC, BUSD, CAKE
-
-[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-☕-yellow.svg)](https://buymeacoffee.com/ngoviet)
 
 <!-- support:start -->
 ## Support the project
@@ -388,9 +388,10 @@ Accepts: BTC, ETH, USDT, BNB, USDC, BUSD, CAKE
   <img src="https://raw.githubusercontent.com/ngoviet/.github/main/assets/support/vietqr-card.svg" width="300" alt="VietQR — MB Bank — NGO DUC VIET — 911051212">
 </p>
 
-<p align="center"><sub>🇻🇳 VietQR: quét bằng app ngân hàng bất kỳ, nội dung <code>Ung ho smartsolar_ha</code>. Cảm ơn bạn! · Thank you for keeping this project alive.</sub></p>
+<p align="center"><sub>🇻🇳 VietQR: scan with any Vietnamese banking app, transfer note <code>Ung ho smartsolar_ha</code>. Thank you for keeping this project alive!</sub></p>
+<p align="center"><sub>Crypto (BEP20 network): <code>0x57f07d44fb581cddc028a0c67d63a8cc05aa6caa</code> · USDT · USDC · BNB · ETH · BTC</sub></p>
 <!-- support:end -->
 
----
+## License
 
-Made with ❤️ by [@ngoviet](https://github.com/ngoviet) — if you find it useful, give it a ⭐ on GitHub!
+[MIT](LICENSE) © Ngô Đức Việt. Not affiliated with or endorsed by Mạnh Quân / SmartSolar.
