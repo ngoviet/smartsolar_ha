@@ -371,6 +371,26 @@ Accepts: BTC, ETH, USDT, BNB, USDC, BUSD, CAKE
 
 [![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-☕-yellow.svg)](https://buymeacoffee.com/ngoviet)
 
+<!-- support:start -->
+## Support the project
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ngoviet/.github/main/assets/support/banner.svg" width="720" alt="Built and maintained by one person in Việt Nam">
+</p>
+
+<p align="center">
+  <a href="https://buymeacoffee.com/ngoviet"><img src="https://raw.githubusercontent.com/ngoviet/.github/main/assets/support/btn-coffee.svg" height="56" alt="Buy me a coffee"></a>
+  &nbsp;
+  <a href="https://github.com/sponsors/ngoviet"><img src="https://raw.githubusercontent.com/ngoviet/.github/main/assets/support/btn-sponsors.svg" height="56" alt="GitHub Sponsors"></a>
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ngoviet/.github/main/assets/support/vietqr-card.svg" width="300" alt="VietQR — MB Bank — NGO DUC VIET — 911051212">
+</p>
+
+<p align="center"><sub>🇻🇳 VietQR: quét bằng app ngân hàng bất kỳ, nội dung <code>Ung ho smartsolar_ha</code>. Cảm ơn bạn! · Thank you for keeping this project alive.</sub></p>
+<!-- support:end -->
+
 ---
 
 Made with ❤️ by [@ngoviet](https://github.com/ngoviet) — if you find it useful, give it a ⭐ on GitHub!
