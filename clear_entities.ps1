@@ -23,7 +23,7 @@
 
     Usage:
         # 1. Stop Home Assistant first (it rewrites .storage on shutdown)
-        ssh vokupt@192.168.10.15 "sudo docker stop homeassistant"
+        ssh vokupt@192.168.12.20 "sudo docker stop homeassistant"
         # 2. Then run this script, then start HA again
         powershell -File clear_entities.ps1
 
@@ -31,7 +31,7 @@
     surgery can be exercised against a copy instead of the live instance.
 #>
 param(
-    [string]$HaHost = "192.168.10.15",
+    [string]$HaHost = "192.168.12.20",
     [string]$ConfigRoot = "",
     [switch]$Force
 )

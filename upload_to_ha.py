@@ -6,7 +6,7 @@ import sys
 
 import paramiko
 
-HA_HOST = os.environ.get("HA_HOST", "192.168.10.15")
+HA_HOST = os.environ.get("HA_HOST", "192.168.12.20")
 HA_USER = os.environ.get("HA_USER", "vokupt")
 SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_components", "smartsolar_ha")
 DST_DIR = "/homeassistant/custom_components/smartsolar_ha"

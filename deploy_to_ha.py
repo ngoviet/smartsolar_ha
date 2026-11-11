@@ -72,7 +72,7 @@ HA_CONTAINER = "homeassistant"
 # core stop timeout.
 DOCKER_STOP_TIMEOUT = 260
 
-HA_HOST = os.environ.get("HA_HOST", "192.168.10.15")
+HA_HOST = os.environ.get("HA_HOST", "192.168.12.20")
 HA_USER = os.environ.get("HA_USER", "vokupt")
 HA_URL = os.environ.get("HA_URL", f"http://{HA_HOST}:8123")
 
