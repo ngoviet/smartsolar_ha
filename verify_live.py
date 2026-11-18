@@ -9,7 +9,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-HA_HOST = os.environ.get("HA_HOST", "192.168.10.15")
+HA_HOST = os.environ.get("HA_HOST", "192.168.12.20")
 BASE = f"http://{HA_HOST}:8123"
 
 # The entity ids this verifier asserts on. Home Assistant writes entity states
